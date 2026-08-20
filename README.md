@@ -32,7 +32,7 @@ CiA 402 state machine) that all modes build on.
 ## Build
 
 ```bash
-gcc cst/jcr_cst_demo.c -o jcr_cst_demo \
+gcc cst/cst_demo.c -o cst_demo \
     -I <SOEM>/include -I <SOEM>/build/include \
     -I <SOEM>/osal -I <SOEM>/osal/linux -I <SOEM>/oshw/linux \
     -L <SOEM>/build -lsoem -lpthread -lrt
@@ -55,9 +55,6 @@ sudo ./cst_demo <network-interface>     # e.g. enp0s31f5
 
 The CST/CSV samples command **motor torque/velocity**. Ensure the shaft is free or safely loaded, keep an emergency stop within reach, and start with small setpoints. All samples perform a controlled zero-command shutdown on Ctrl+C.
 
-## Validation
-
-The CST sample and tools were validated on JCR joint modules (17:1 harmonic reduction) and MDX+ EtherCAT drives: 5/5 cold-boot first-attempt SAFE-OP transitions (40.2 ± 0.1 ms with full configuration), continuous 1 kHz AL-register monitoring with zero error activity, sustained 500 µs cyclic operation on PREEMPT_RT.
 
 ## License / Disclaimer
 
