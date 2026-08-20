@@ -41,14 +41,14 @@ gcc cst/jcr_cst_demo.c -o jcr_cst_demo \
 ## Run
 
 ```bash
-sudo ./jcr_cst_demo <network-interface>     # e.g. enp0s31f6
+sudo ./cst_demo <network-interface>     # e.g. enp0s31f5
 ```
 
 ## Key implementation notes
 
 - **Startup parameters:** these drives ship with all torque/velocity limit objects at 0 (0x2A47, 0x6072, 0x6073, 0x60E0/0x60E1, 0x607F). Each zero silently clamps motion while the drive reports a healthy status. The samples write the complete chain during PRE-OP.
 - **PDO mapping:** the factory RxPDO targets position modes; the samples remap 0x1600 to Controlword + Modes of operation + Target torque during the PRE-OP→SAFE-OP hook (remapping is only permitted in PRE-OP).
-- **Distributed Clocks:** standard SOEM activation (`ecx_dcsync0`) is sufficient; Sync0 is armed before the SAFE-OP transition. Validated at 500 µs and 4 ms cycle times.
+- **Distributed Clocks:** standard SOEM activation (`ecx_dcsync0`) is sufficient; Sync0 is armed before the SAFE-OP transition. Validated at 500 µs cycle times.
 - **Shutdown order:** leave OP before deactivating Sync0 — stopping the sync pulses while the drive is in OP trips its sync-loss monitoring.
 
 ## ⚠️ Safety
