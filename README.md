@@ -12,10 +12,7 @@ trajectory generator and have relaxed timing requirements.
 | Cyclic Synchronous Position (CSP) | 8 | `csp_example.c` | yes | ✅ validated on MDX+_EC |
 | Cyclic Synchronous Velocity (CSV) | 9 | `csv_example.c` | yes | ✅ validated on MDX+_EC |
 | Cyclic Synchronous Torque (CST) | 10 | `cst_example.c` | yes | ✅ validated on MDX+_EC |
-| Profile Position (PP) | 1 | `pp_example.c` | no | planned |
-| Profile Velocity (PV) | 3 | `pv_example.c` | no | planned |
-| Profile Torque (TQ) | 4 | `tq_example.c` | no | planned |
-| Homing (HM) | 6 | `hm_example.c` | no | planned |
+
 
 **Test hardware:** All ✅ status entries validated on the [**MDXT61GNBECA000**](https://www.applied-motion.com/s/product/mdxt61g-ec000/01tJ30000033rKSIAY?name=MDXT61GNBECA000-200W-IP65-MDX-w-17-bit-Absolute-Encoder) — MDX+ EtherCAT integrated servo, 200 W, IP65, 17-bit absolute encoder.
 
