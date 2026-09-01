@@ -17,6 +17,8 @@ trajectory generator and have relaxed timing requirements.
 | Profile Torque (TQ) | 4 | `tq_example.c` | no | planned |
 | Homing (HM) | 6 | `hm_example.c` | no | planned |
 
+**Test hardware:** All ✅ status entries validated on the [**MDXT61GNBECA000**](https://www.applied-motion.com/s/product/mdxt61g-ec000/01tJ30000033rKSIAY?name=MDXT61GNBECA000-200W-IP65-MDX-w-17-bit-Absolute-Encoder) — MDX+ EtherCAT integrated servo, 200 W, IP65, 17-bit absolute encoder.
+
 Samples for the planned modes will be added incrementally; the CSP/CSV/CST
 samples establish the shared bring-up (DC sync, PDO mapping, CiA 402 state
 machine) that all modes build on.
