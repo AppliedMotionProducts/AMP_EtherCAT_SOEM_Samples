@@ -3,26 +3,28 @@
  *                 EtherCAT servo drives (MDX+ series).
  *
  * Demonstrates a complete CSP bring-up with the open-source SOEM 2.x master:
- *   - Distributed Clocks, Sync0 = 500 us, standard activation
- *   - Required startup SDO parameters (limit objects)
- *   - RxPDO remapped to Controlword + Modes of operation + Target position
+ *   - Distributed Clocks, Sync0 = 1 ms, standard activation
+ *   - Required startup SDO parameters (limit objects, interpolation period)
+ *   - RxPDO 0x1600: Controlword + Modes + Target position       (7 bytes)
+ *   - TxPDO 0x1A00: Statusword + Position + Error + Mode        (9 bytes)
  *   - Phase-locked real-time cyclic loop (drive DC clock reference)
- *   - Bumpless enable: target position tracks actual position until the
- *     drive is enabled, then a trapezoidal move is streamed
+ *   - Bumpless enable (target tracks actual position until enabled), then a
+ *     smooth trapezoidal move: out, dwell, return, settle, disable
+ *
+ * VALIDATED at 1 ms and 4 ms DC cycles on MDX+_EC.
  *
  * Platform: Linux with PREEMPT_RT kernel recommended. Build:
  *   gcc csp_example.c -o csp_example \
  *       -I <SOEM>/include -I <SOEM>/build/include -I <SOEM>/osal \
  *       -I <SOEM>/osal/linux -I <SOEM>/oshw/linux \
- *       -L <SOEM>/build -lsoem -lpthread -lrt
+ *       -L <SOEM>/build -lsoem -lpthread -lrt -lm
  *
  * Usage:  sudo ./csp_example <network-interface>
  *
- * SAFETY: This program MOVES THE MOTOR through a position profile. Ensure
- * the axis has free travel for the configured move distance, keep an
- * emergency stop within reach. Ctrl+C decelerates and performs a controlled
- * shutdown. Verify MOVE_COUNTS against your encoder resolution and gearing
- * before running on a loaded axis.
+ * SAFETY: This program MOVES THE MOTOR (one revolution out and back by
+ * default). Ensure free travel, keep an emergency stop within reach.
+ * Ctrl+C performs a controlled shutdown. Verify COUNTS_PER_REV against
+ * your drive's position scaling before running on a loaded axis.
  ******************************************************************************/
 
 #include <stdio.h>
@@ -31,23 +33,27 @@
 #include <inttypes.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/mman.h>
 #include "soem/soem.h"
 
 /* ---- Configuration ------------------------------------------------------ */
-#define CYCLE_NS          500000   /* cyclic period and Sync0 cycle (500 us) */
+#define CYCLE_NS          1000000  /* 1 ms.                      */
 #define NSEC_PER_SEC      1000000000
-#define SYNC0_MARGIN_US   2000     /* delay between Sync0 activation and the
-                                      SAFE-OP request                        */
-#define MODE_CSP          8        /* CiA 402 mode of operation              */
+#define SYNC0_MARGIN_US   2000
+#define MODE_CSP          8
 
-/* Motion profile (units: encoder counts, counts/cycle).
-   VERIFY against your encoder resolution before running: e.g. with a 20-bit
-   encoder (1,048,576 counts/rev), CRUISE_CPC=100 at 500 us equals
-   100 * 2000 = 200,000 counts/s = ~0.19 motor rev/s.                        */
-#define MOVE_COUNTS       100000   /* total move distance (counts)           */
-#define CRUISE_CPC        100      /* cruise velocity (counts per cycle)     */
-#define ACCEL_CPC2        1        /* acceleration (counts/cycle^2)          */
-#define DWELL_CYCLES      2000     /* pause at the far end (2000 x 500us=1s) */
+/* Motion profile in physical units (10,000 counts = 1 rev, measured) */
+#define COUNTS_PER_REV    10000.0  /* measured: 1.00 rev = 10000 command counts (electronic gearing) */
+#define MOVE_REVS         1.0      /* move distance: 1 revolution           */
+#define CRUISE_RPS        1.0      /* cruise speed: 1 rev/s                 */
+#define ACCEL_RPS2        2.0      /* accel: 2 rev/s^2 -> cruise in 0.5 s   */
+#define DWELL_CYCLES      1000     /* pause at far end: 1 s at 1 ms     */
+#define CYCLE_S           (CYCLE_NS / 1e9)
+#define MOVE_COUNTS       (MOVE_REVS   * COUNTS_PER_REV)
+#define CRUISE_CPS        (CRUISE_RPS  * COUNTS_PER_REV)          /* counts/s     */
+#define ACCEL_CPS2        (ACCEL_RPS2  * COUNTS_PER_REV)          /* counts/s^2   */
+
+#define WKC_TRIP          8        /* consecutive WKC misses -> safe stop    */
 
 static ecx_contextt ctx;
 static uint8 IOmap[4096];
@@ -64,8 +70,9 @@ static volatile int      g_enabled    = 0;
 static volatile int      g_inOP       = 0;
 static volatile int      g_done       = 0;
 static volatile int64_t  g_toff       = 0;
+static volatile int      g_stop       = 0;  /* 0 ok, 1 bus(WKC), 2 fault, 3 bringup */
+static int expectedWKC = 0;
 
-/* Microsecond timestamp since program start (for stage timing output) */
 static struct timespec tz;
 static int64_t now_us(void){
    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -74,20 +81,19 @@ static int64_t now_us(void){
 #define STAGE(...) do{ printf("[%8lld us] ", (long long)now_us()); \
                        printf(__VA_ARGS__); printf("\n"); }while(0)
 
-/* Process data images. pack(1): layout must match the wire format exactly. */
+/* Process data images - BOTH directions remapped by this program, so these
+   structs are authoritative. pack(1): no padding, matches the wire.        */
 #pragma pack(push,1)
-typedef struct {                    /* RxPDO 0x1600 after remap (7 bytes)   */
+typedef struct {                    /* RxPDO 0x1600 (7 bytes)               */
    uint16_t controlword;            /* 0x6040 */
    int8_t   modes_of_operation;     /* 0x6060 */
-   int32_t  target_position;        /* 0x607A, encoder counts               */
+   int32_t  target_position;        /* 0x607A, command counts               */
 } out_pdo_t;
-typedef struct {                    /* TxPDO 0x1A00 factory default, leading
-                                       fields of the 35-byte image          */
-   uint16_t error_code;             /* 0x603F */
+typedef struct {                    /* TxPDO 0x1A00 (9 bytes, our mapping)  */
    uint16_t statusword;             /* 0x6041 */
+   int32_t  position_actual;        /* 0x6064, command counts               */
+   uint16_t error_code;             /* 0x603F */
    int8_t   modes_display;          /* 0x6061 */
-   int32_t  position_actual;        /* 0x6064 */
-   int32_t  follow_error;           /* 0x60F4 */
 } in_pdo_t;
 #pragma pack(pop)
 
@@ -96,15 +102,11 @@ static in_pdo_t  *in;
 
 /* ---- Distributed-clock phase lock --------------------------------------- */
 static int64 toff = 0;
-
 static void add_time_ns(ec_timet *ts, int64 addtime){
    ec_timet a; a.tv_nsec = addtime % NSEC_PER_SEC;
    a.tv_sec  = (addtime - a.tv_nsec)/NSEC_PER_SEC;
    osal_timespecadd(ts,&a,ts);
 }
-
-/* PI controller: trims the loop period so frame transmission stays locked
-   to the drive's DC clock. */
 static void ec_sync(int64 reftime, int64 cycletime, int64 *offsettime){
    static int64 integral = 0;
    int64 delta = reftime % cycletime;
@@ -127,17 +129,15 @@ static int drive_setup(ecx_contextt *c, uint16 slave){
    STAGE("[PO2SO] configuring slave %u", slave);
 
    /* Startup parameters. These limit objects default to 0 on the drive and
-      must be set for motion to be produced (the position loop's torque and
-      velocity outputs are clamped by them). */
+      must be set for motion to be produced. */
    u16=1000;    sdo_w(slave,0x6072,0,2,&u16,"6072 MaxTorque");
    u16=1000;    sdo_w(slave,0x6073,0,2,&u16,"6073 MaxCurrent");
    u16=3000;    sdo_w(slave,0x60E0,0,2,&u16,"60E0 PosTorqueLim");
    u16=3000;    sdo_w(slave,0x60E1,0,2,&u16,"60E1 NegTorqueLim");
    u32=1000000; sdo_w(slave,0x607F,0,4,&u32,"607F MaxVelocity");
 
-   /* RxPDO remap: 0x1600 = Controlword + Modes + Target position.
-      Sequence per CiA 402: disable assignment, clear, write entries
-      (index<<16 | sub<<8 | bitlen), set count, re-assign, enable. */
+   /* RxPDO 0x1600: Controlword + Modes + Target position (7 bytes).
+      Entry format: (index<<16) | (subindex<<8) | bit length.               */
    u8=0;            sdo_w(slave,0x1C12,0,1,&u8, "1C12 clear");
    u8=0;            sdo_w(slave,0x1600,0,1,&u8, "1600 clear");
    u32=0x60400010;  sdo_w(slave,0x1600,1,4,&u32,"map Controlword");
@@ -146,52 +146,66 @@ static int drive_setup(ecx_contextt *c, uint16 slave){
    u8=3;            sdo_w(slave,0x1600,0,1,&u8, "1600 count=3");
    u16=0x1600;      sdo_w(slave,0x1C12,1,2,&u16,"1C12 assign 1600");
    u8=1;            sdo_w(slave,0x1C12,0,1,&u8, "1C12 count=1");
-   /* TxPDO 0x1A00 is left at the factory default. */
 
+   /* TxPDO 0x1A00: Statusword + Position actual + Error code + Mode display
+      (9 bytes). Remapped so the input layout is OURS on every MDX+ variant
+      - factory input PDOs differ between configurations.                   */
+   u8=0;            sdo_w(slave,0x1C13,0,1,&u8, "1C13 clear");
+   u8=0;            sdo_w(slave,0x1A00,0,1,&u8, "1A00 clear");
+   u32=0x60410010;  sdo_w(slave,0x1A00,1,4,&u32,"map Statusword");
+   u32=0x60640020;  sdo_w(slave,0x1A00,2,4,&u32,"map PositionActual");
+   u32=0x603F0010;  sdo_w(slave,0x1A00,3,4,&u32,"map ErrorCode");
+   u32=0x60610008;  sdo_w(slave,0x1A00,4,4,&u32,"map ModesDisplay");
+   u8=4;            sdo_w(slave,0x1A00,0,1,&u8, "1A00 count=4");
+   u16=0x1A00;      sdo_w(slave,0x1C13,1,2,&u16,"1C13 assign 1A00");
+   u8=1;            sdo_w(slave,0x1C13,0,1,&u8, "1C13 count=1");
+
+   /* interpolation time period = 5 x 10^-4 s = 500 us (CSP validates this) */
+   /* interpolation time period = 1 x 10^-3 s = 1 ms (matches Sync0) */
+   u8 = 1;            sdo_w(slave,0x60C2,1,1,&u8, "60C2:1 interp value");
+   { int8_t e = -3;   sdo_w(slave,0x60C2,2,1,&e,  "60C2:2 interp exponent"); }
    { int8_t m=MODE_CSP; sdo_w(slave,0x6060,0,1,&m,"6060 mode=CSP"); }
    return 1;
 }
 
 /* ---- Trajectory generator (runs inside the cyclic thread) ----------------
    Trapezoidal profile in counts/cycle: accelerate to CRUISE_CPC, cruise,
-   decelerate to stop exactly at the target; dwell; return the same way.
-   Generated cycle-synchronously so the streamed positions are smooth.      */
+   decelerate to stop exactly at the target; dwell; return the same way.   */
+/* Smooth trapezoidal profile, floating point: accel/cruise/decel with
+   d = v^2/(2a) stopping rule; dwell at far end; return; done. */
 static int32_t traj_step(void){
-   static int64_t pos = 0;          /* profile position (relative)          */
-   static int32_t vel = 0;          /* current counts/cycle                 */
-   static int      leg = 0;         /* 0: out, 1: dwell, 2: back, 3: done   */
-   static int      dwell = 0;
-   int64_t target = (leg == 0) ? MOVE_COUNTS : 0;
+   static double pos = 0.0, vel = 0.0;   /* counts, counts/s */
+   static int leg = 0, dwell = 0, settle = 0; /* 0 out,1 dwell,2 back,3 settle */
+   double target = (leg == 0) ? MOVE_COUNTS : 0.0;
 
-   if (leg == 1){                                  /* dwell at far end      */
-      if (++dwell >= DWELL_CYCLES) leg = 2;
+   if (leg == 1){ if (++dwell >= DWELL_CYCLES) leg = 2; return (int32_t)pos; }
+   if (leg == 3){
+      /* SETTLE: the motor trails the commanded target (following lag).
+         Disabling immediately would strand it short of home and shift the
+         start of every subsequent run. Hold the final target until the
+         drive reports target-reached (statusword bit 10), 3 s timeout. */
+      if ((g_statusword & 0x0400) || (++settle >= 3 * (NSEC_PER_SEC/CYCLE_NS)))
+         g_done = 1;
       return (int32_t)pos;
    }
-   if (leg == 3){ g_done = 1; return (int32_t)pos; }
 
-   int64_t dist = target - pos;                    /* signed distance to go */
-   int dir = (dist >= 0) ? 1 : -1;
-   int64_t adist = dir * dist;
+   double dist  = target - pos;
+   double dir   = (dist >= 0) ? 1.0 : -1.0;
+   double adist = dir * dist;
+   double stopd = (vel * vel) / (2.0 * ACCEL_CPS2);
 
-   /* decelerate when the remaining distance needs it: d = v^2 / (2a) */
-   int64_t stopdist = ((int64_t)vel * vel) / (2 * ACCEL_CPC2);
-   if (adist <= stopdist)            vel -= ACCEL_CPC2;   /* decel  */
-   else if (vel < CRUISE_CPC)        vel += ACCEL_CPC2;   /* accel  */
-   if (vel < 0) vel = 0;
+   if (adist <= stopd)          vel -= ACCEL_CPS2 * CYCLE_S;   /* decel  */
+   else if (vel < CRUISE_CPS)   vel += ACCEL_CPS2 * CYCLE_S;   /* accel  */
+   if (vel < 0.0) vel = 0.0;
+   if (vel > CRUISE_CPS) vel = CRUISE_CPS;
 
-   if ((int64_t)vel >= adist){                     /* arrive this cycle     */
-      pos = target; vel = 0;
-      leg = (leg == 0) ? 1 : 3;
-   } else {
-      pos += (int64_t)dir * vel;
-   }
+   double step = vel * CYCLE_S;
+   if (step >= adist){ pos = target; vel = 0.0; leg = (leg==0) ? 1 : 3; }
+   else               pos += dir * step;
    return (int32_t)pos;
 }
 
-/* ---- Real-time cyclic thread --------------------------------------------
-   Every cycle: sleep to the phase-corrected boundary, exchange process
-   data, update the phase lock, run the CiA 402 state machine, stream the
-   position setpoint. */
+/* ---- Real-time cyclic thread -------------------------------------------- */
 OSAL_THREAD_FUNC_RT ecat_rt_thread(void *arg){
    (void)arg;
    static int32_t base = 0;         /* actual position captured at enable   */
@@ -202,7 +216,16 @@ OSAL_THREAD_FUNC_RT ecat_rt_thread(void *arg){
    while (run){
       add_time_ns(&ts, CYCLE_NS + toff);
       osal_monotonic_sleep(&ts);
-      ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+      int wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+
+      /* WKC supervision: consecutive misses = bus fault -> safe stop */
+      static int wkcmiss = 0;
+      if (g_inOP){
+         if (wkc < expectedWKC){
+            if (++wkcmiss >= WKC_TRIP){ g_stop = 1; run = 0; }
+         } else wkcmiss = 0;
+      }
+
       if (ctx.slavelist[0].hasdc)
          ec_sync(ctx.DCtime, CYCLE_NS, &toff);
       g_toff = toff;
@@ -214,20 +237,21 @@ OSAL_THREAD_FUNC_RT ecat_rt_thread(void *arg){
       if (g_inOP){
          if (!g_enabled){
             /* CiA 402 enable sequence, driven by the statusword */
-            if      ((sw & 0x004F)==0x0040) out->controlword=0x0006; /* Shutdown     */
-            else if ((sw & 0x006F)==0x0021) out->controlword=0x0007; /* Switch on    */
-            else if ((sw & 0x006F)==0x0023) out->controlword=0x000F; /* Enable op.   */
+            if      ((sw & 0x004F)==0x0040) out->controlword=0x0006;
+            else if ((sw & 0x006F)==0x0021) out->controlword=0x0007;
+            else if ((sw & 0x006F)==0x0023) out->controlword=0x000F;
             else if ((sw & 0x006F)==0x0027){ g_enabled=1; base = in->position_actual; }
-            else if  (sw & 0x0008)          out->controlword=0x0080; /* Fault reset  */
+            else if  (sw & 0x0008)          out->controlword=0x0080;
 
             /* CSP CRITICAL: while not enabled, the target must TRACK the
-               actual position. Enabling with a stale target would command
-               an instantaneous jump to it - the axis would lunge or fault
-               on following error. This makes the enable bumpless.          */
+               actual position, so the enable is bumpless. */
             out->target_position = in->position_actual;
+         } else if (sw & 0x0008){
+            /* drive fault while running: hold at actual, flag, safe stop */
+            out->target_position = in->position_actual;
+            g_stop = 2; run = 0;
          } else {
             out->controlword = 0x000F;
-            /* stream the profile relative to the position at enable */
             out->target_position = base + traj_step();
          }
          out->modes_of_operation = MODE_CSP;
@@ -239,10 +263,11 @@ OSAL_THREAD_FUNC_RT ecat_rt_thread(void *arg){
 
 int main(int argc, char *argv[]){
    clock_gettime(CLOCK_MONOTONIC, &tz);
-   printf("EtherCAT CSP example (500 us DC cycle, SOEM master)\n\n");
+   printf("AMP EtherCAT CSP example (1 ms DC cycle, SOEM master)\n\n");
 
    if (argc != 2){ printf("Usage: sudo %s <ifname>\n", argv[0]); return 1; }
    signal(SIGINT, on_sigint);
+   mlockall(MCL_CURRENT | MCL_FUTURE);
 
    if (!ecx_init(&ctx, argv[1])){ printf("ERROR: cannot open %s (root required)\n", argv[1]); return 1; }
    STAGE("NIC open");
@@ -250,9 +275,13 @@ int main(int argc, char *argv[]){
    if (ecx_config_init(&ctx) <= 0){ printf("ERROR: no slaves found\n"); ecx_close(&ctx); return 1; }
    STAGE("bus scanned: %d slave(s), '%s' in PRE-OP",
          ctx.slavecount, ctx.slavelist[1].name);
+   if (ctx.slavecount != 1){
+      printf("ERROR: this single-axis example expects exactly 1 slave, found %d.\n"
+             "       Use the two-slave example, or connect only one drive.\n",
+             ctx.slavecount);
+      ecx_close(&ctx); return 1;
+   }
 
-   /* Distributed clocks: measure delays, then activate Sync0 before the
-      SAFE-OP transition (DC configuration is validated at that transition). */
    ctx.slavelist[1].PO2SOconfig = drive_setup;
    ecx_configdc(&ctx);
    ecx_dcsync0(&ctx, 1, TRUE, CYCLE_NS, 0);
@@ -262,41 +291,51 @@ int main(int argc, char *argv[]){
    ecx_config_map_group(&ctx, IOmap, 0);
    out = (out_pdo_t *)ctx.slavelist[1].outputs;
    in  = (in_pdo_t  *)ctx.slavelist[1].inputs;
-   STAGE("process image mapped: %d out / %d in bytes",
-         ctx.slavelist[1].Obytes, ctx.slavelist[1].Ibytes);
+   STAGE("process image mapped: %d out / %d in bytes (expect %zu / %zu)",
+         ctx.slavelist[1].Obytes, ctx.slavelist[1].Ibytes,
+         sizeof(out_pdo_t), sizeof(in_pdo_t));
+   if (ctx.slavelist[1].Obytes != sizeof(out_pdo_t) ||
+       ctx.slavelist[1].Ibytes != sizeof(in_pdo_t)){
+      printf("ERROR: mapped sizes do not match the remap - aborting.\n");
+      g_stop = 3; goto shutdown;
+   }
 
    /* Verify SAFE-OP on fresh state; retry acknowledges and re-requests. */
-   int reached = 0;
-   for (int attempt = 1; attempt <= 3; attempt++){
-      ecx_statecheck(&ctx, 1, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
-      ecx_readstate(&ctx);
-      if (ctx.slavelist[1].state == EC_STATE_SAFE_OP){
-         STAGE("SAFE-OP reached (attempt %d)", attempt);
-         reached = 1; break;
+   {
+      int reached = 0;
+      for (int attempt = 1; attempt <= 3; attempt++){
+         ecx_statecheck(&ctx, 1, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
+         ecx_readstate(&ctx);
+         if (ctx.slavelist[1].state == EC_STATE_SAFE_OP){
+            STAGE("SAFE-OP reached (attempt %d)", attempt);
+            reached = 1; break;
+         }
+         STAGE("SAFE-OP attempt %d incomplete: state=0x%02x AL=0x%04x",
+               attempt, ctx.slavelist[1].state, ctx.slavelist[1].ALstatuscode);
+         ctx.slavelist[1].state = EC_STATE_SAFE_OP + EC_STATE_ACK;
+         ecx_writestate(&ctx, 1);
+         osal_usleep(100000);
+         ctx.slavelist[1].state = EC_STATE_SAFE_OP;
+         ecx_writestate(&ctx, 1);
       }
-      STAGE("SAFE-OP attempt %d incomplete: state=0x%02x AL=0x%04x",
-            attempt, ctx.slavelist[1].state, ctx.slavelist[1].ALstatuscode);
-      ctx.slavelist[1].state = EC_STATE_SAFE_OP + EC_STATE_ACK;
-      ecx_writestate(&ctx, 1);
-      osal_usleep(100000);
-      ctx.slavelist[1].state = EC_STATE_SAFE_OP;
-      ecx_writestate(&ctx, 1);
+      if (!reached){ printf("ERROR: SAFE-OP not reached\n"); g_stop = 3; goto shutdown; }
    }
-   if (!reached){ printf("ERROR: SAFE-OP not reached\n"); goto shutdown; }
 
-   /* Prime outputs with safe values, start the cyclic thread.
-      Target position is primed to the current actual position. */
+   /* Prime outputs with safe values: target = current actual position. */
    ecx_send_processdata(&ctx); ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
    out->controlword=0; out->modes_of_operation=MODE_CSP;
    out->target_position = in->position_actual;
    ecx_send_processdata(&ctx); ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
 
+   expectedWKC = (ctx.grouplist[0].outputsWKC*2) + ctx.grouplist[0].inputsWKC;
+   STAGE("expected WKC: %d", expectedWKC);
+
    OSAL_THREAD_HANDLE rt;
    osal_thread_create_rt(&rt, 128000, (void*)&ecat_rt_thread, NULL);
    STAGE("cyclic thread running");
 
-   /* Request OP immediately; the DC phase lock converges during the
-      transition (the target tracks actual position throughout the enable). */
+   /* Request OP immediately; DC phase lock converges during the transition
+      (target tracks actual position throughout the enable). */
    ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
    ecx_writestate(&ctx, 0);
    for (int i=0;i<1000;i++){
@@ -306,7 +345,7 @@ int main(int argc, char *argv[]){
    }
    if (ctx.slavelist[0].state != EC_STATE_OPERATIONAL){
       STAGE("ERROR: OP not reached (AL=0x%04x)", ctx.slavelist[1].ALstatuscode);
-      run=0; goto shutdown;
+      run=0; g_stop=3; goto shutdown;
    }
    STAGE("OPERATIONAL");
    g_inOP = 1;
@@ -317,25 +356,31 @@ int main(int argc, char *argv[]){
    }
    if (!g_enabled){
       STAGE("ERROR: enable failed sw=0x%04x err=0x%04x", g_statusword, g_errcode);
-      run=0; goto shutdown;
+      run=0; g_stop=3; goto shutdown;
    }
-   STAGE("ENABLED sw=0x%04x mode=%d  base=%d", g_statusword, g_modedisp, g_position);
+   STAGE("ENABLED sw=0x%04x mode=%d base=%d", g_statusword, g_modedisp, g_position);
 
-   /* Monitor the move: out MOVE_COUNTS, dwell, and back. */
-   STAGE("CSP move: +%d counts, cruise %d counts/cycle - WATCH THE AXIS",
-         MOVE_COUNTS, CRUISE_CPC);
+   STAGE("CSP move: +%.1f rev at %.1f rev/s (accel %.1f rev/s^2) - WATCH THE AXIS",
+         MOVE_REVS, CRUISE_RPS, ACCEL_RPS2);
    long c=0;
    while (run && !g_done){
-      if ((c++ % 200)==0)
+      if ((c++ % 100)==0)   /* every 100 ms at 1 ms */
          printf("target=%11d  actual=%11d  sw=0x%04x err=0x%04x toff=%lld\n",
                 g_target, g_position, g_statusword, g_errcode, (long long)g_toff);
       osal_usleep(CYCLE_NS/1000);
    }
-   STAGE("move complete");
+   if (!g_stop) STAGE("move complete");
+
+    if (g_stop == 1){
+      ecx_readstate(&ctx);
+      STAGE("!!! STOPPED: WKC loss. slave state=0x%02x AL=0x%04x sw=0x%04x err=0x%04x",
+            ctx.slavelist[1].state, ctx.slavelist[1].ALstatuscode,
+            g_statusword, g_errcode);
+   }
+   if (g_stop == 2) STAGE("!!! STOPPED: drive fault sw=0x%04x err=0x%04x",
+                          g_statusword, g_errcode);
 
 shutdown:
-   /* Controlled shutdown: disable (target already at rest), leave OP, then
-      stop Sync0 - Sync0 must remain active until the drive has left OP. */
    STAGE("shutting down");
    run = 0; osal_usleep(50000);
    if (ctx.slavelist[1].outputs){
@@ -348,5 +393,5 @@ shutdown:
    ecx_dcsync0(&ctx, 1, FALSE, 0, 0);
    ecx_close(&ctx);
    STAGE("done");
-   return 0;
+   return g_stop;
 }
